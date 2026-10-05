@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PTBridge</string>
+    <string name="desc">Bluetooth page-turner key bridge</string>
+</resources>

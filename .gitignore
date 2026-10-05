@@ -1,0 +1,30 @@
+# ---------- 构建产物 ----------
+app/out/
+app/classes.dex
+app/unsigned.apk
+app/aligned.apk
+app/*.apk
+app/*.idsig
+
+# ---------- 本地配置与密钥（绝不提交）----------
+app/build.env
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+*.pub
+
+# ---------- 设备侧运行期产物 ----------
+*.log
+*.state
+*.pid
+
+# ---------- 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+*.iml
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

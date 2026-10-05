@@ -1,0 +1,13 @@
+# shell 脚本必须保持 LF —— 换行变成 CRLF 后丢到 Android 上会直接执行失败
+*.sh      text eol=lf
+*.java    text eol=lf
+*.xml     text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+
+# 二进制，别做任何转换
+*.png     binary
+*.jpg     binary
+*.apk     binary
+*.dex     binary
+*.keystore binary
