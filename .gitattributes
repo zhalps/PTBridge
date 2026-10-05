@@ -4,6 +4,7 @@
 *.xml     text eol=lf
 *.md      text eol=lf
 *.yml     text eol=lf
+LICENSE   text eol=lf
 
 # 二进制，别做任何转换
 *.png     binary
