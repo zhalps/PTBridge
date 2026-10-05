@@ -194,7 +194,7 @@ static volatile boolean sConnected = false;   // onServiceConnected / onDestroy 
 /data/adb/duo2-net.sh             ← net-autoswitch.sh，每 30s reconcile 一次
         │ 写状态
         ▼
-/data/adb/duo2-net.state          ← 内容形如 "HomeWiFi 192.168.1.2"，面板读它显示网关
+/data/adb/duo2-net.state          ← 内容形如 "HomeWiFi 6"，面板读它显示网关（"3.6"）
 ```
 
 设计要点：

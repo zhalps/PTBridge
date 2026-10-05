@@ -169,7 +169,8 @@ Magisk 的授权可以顺手把提示关掉（每次 su 都弹一条黑条会烦
 | 滑动参数 | `PageTurnerService.swipe()` 调用处 | y 值、时长要按目标 App 试 |
 | 按键识别 | `handleTouch()` 里的 `name.contains("Virtual")` | `logcat -s PTBridge` 看 `TOUCH ... dev=[...]` |
 | 长按键码 | `onKeyEvent()` 里的 `KEYCODE_VOLUME_DOWN` | 同上，看 `key <code>` 日志 |
-| 旁路由网段 | `scripts/net-autoswitch.sh` 顶部的 `GW_PREFIX` / `GWS` | 改成你自己的网段与旁路由地址 |
+| 网关显示前缀 | `MainActivity.GW_PREFIX` | 改成你网段的前三段，要和脚本里的 `GW_PREFIX` 一致 |
+| 旁路由地址 | `scripts/net-autoswitch.sh` 顶部的 `GW_PREFIX` / `GWS` | 改成你自己的网段与旁路由地址 |
 | 微信读书包名 | `PageTurnerService.WEREAD_PKG` | 一般不用改 |
 
 调这些的时候 `logcat` 是最好的工具 —— 服务把**每一个**触摸和按键都无条件记下来了：

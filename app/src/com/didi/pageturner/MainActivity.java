@@ -83,7 +83,7 @@ import android.widget.TextView;
  * v16：
  *  - 打开面板时**自动确保「按 SSID 切网关/DNS」的守护进程在跑**，并回读当前生效的网关
  *    显示在左上角（`SSH: ON | Gateway: 3.6`）。守护本身按 SSID 决定用哪个旁路由：
- *      HomeWiFi -> 192.168.1.2 ；OfficeWiFi -> 192.168.1.3 ；其它 SSID -> 撤规则、走直连
+ *      HomeWiFi -> 192.168.3.2 ；OfficeWiFi -> 192.168.3.3 ；其它 SSID -> 撤规则、走直连
  *    为什么需要：守护由 /data/adb/service.d 的监管拉起，正常情况下不会被清理掉
  *    （oom_score_adj = -1000，和 magiskd 同级）；但万一 service.d 没执行、或将来被
  *    清掉，这里就是一个人肉可控的兜底入口 —— 点开面板即恢复。
@@ -133,7 +133,11 @@ public class MainActivity extends Activity {
     // v16：按 SSID 自动切网关的守护（脚本在设备上，由 service.d 监管拉起）
     static final String NET_SUP = "/data/adb/service.d/duo2-net.sh";
     static final String NET_DAEMON = "/data/adb/duo2-net.sh";
-    static final String NET_STATE = "/data/adb/duo2-net.state";   // 内容形如 "HomeWiFi 192.168.1.2"
+    static final String NET_STATE = "/data/adb/duo2-net.state";   // 内容形如 "HomeWiFi 6"
+
+    // 网关显示前缀：state 文件里只存最后一段（如 "6"），这里补全成 "3.6" 显示。
+    // ⚠️ 网段不一样要改这里 —— 例如网段是 192.168.10.x 就写成 "10."
+    static final String GW_PREFIX = "3.";
 
     // 灰度配色：e-ink 上没有色彩抖动，最耐看
     static final int BG = 0xFFFFFFFF;
@@ -480,7 +484,7 @@ public class MainActivity extends Activity {
      * 正常情况（守护已经在跑）几乎立刻返回，点【Refresh】明显变快。
      *
      * 守护（/data/adb/duo2-net.sh）自己会按 SSID 判断用哪个旁路由：
-     *   HomeWiFi -> 192.168.1.2 ；OfficeWiFi -> 192.168.1.3 ；其它 -> 撤规则走直连。
+     *   HomeWiFi -> 192.168.3.2 ；OfficeWiFi -> 192.168.3.3 ；其它 -> 撤规则走直连。
      * 这里把「监管」和「守护」都顺手拉一次 —— 两者都有单实例守卫
      * （pid 文件里的进程还活着就立刻 exit），所以重复调用是幂等的、很便宜。
      *
@@ -516,9 +520,8 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * state 文件内容形如 "HomeWiFi 192.168.1.2" / "OfficeWiFi 192.168.1.3" / "某SSID -"。
-     * 直接取最后一列当网关 IP 显示；"-" 表示 SSID 不在名单里、规则已撤（走直连）。
-     * （不硬编码网段 —— 脚本写什么就显示什么。）
+     * state 文件内容形如 "HomeWiFi 6" / "OfficeWiFi 99" / "某SSID -"。
+     * 取最后一列拼成 GW_PREFIX+N；"-" 表示 SSID 不在名单里、规则已撤（走直连）。
      */
     static String gwFromState(String out) {
         if (out == null) {
@@ -534,8 +537,8 @@ public class MainActivity extends Activity {
             if ("-".equals(last)) {
                 return "Direct";
             }
-            if (last.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
-                return last;
+            if (last.matches("\\d+")) {
+                return GW_PREFIX + last;
             }
         }
         return "-";
@@ -547,8 +550,8 @@ public class MainActivity extends Activity {
             public void run() {
                 if (netTag != null) {
                     setTextIfChanged(netTag, "Gateway: " + gw);
-                    // 真的是个网关 IP（= 走了旁路由）才用深黑；直连/未知用浅灰
-                    int want = gw.indexOf('.') > 0 ? INK : INK3;
+                    // 真的走了旁路由才用深黑；直连/未知用浅灰
+                    int want = gw.startsWith(GW_PREFIX) ? INK : INK3;
                     if (netTag.getCurrentTextColor() != want) {
                         netTag.setTextColor(want);
                     }

@@ -27,14 +27,14 @@
 
 # ===== 配置（按你的网络改）=================================================
 DEV=wlan0                     # 无线接口名
-GW_PREFIX="192.168.1."        # 旁路由所在网段（前三段 + 点）
-GWS="192.168.1.2 192.168.1.3" # 所有可能用到的旁路由（清规则时逐个删）
+GW_PREFIX="192.168.3."        # 旁路由所在网段（前三段 + 点）
+GWS="192.168.3.2 192.168.3.3" # 所有可能用到的旁路由（清规则时逐个删）
 
 # SSID -> 旁路由最后一段。不在表里就返回空串 = 不干预
 gw_for() {
     case "$1" in
-        HomeWiFi)   echo 2  ;;   # 家里：走 192.168.1.2
-        OfficeWiFi) echo 3  ;;   # 办公室：走 192.168.1.3
+        HomeWiFi)   echo 2  ;;   # 家里：走 192.168.3.2
+        OfficeWiFi) echo 3  ;;   # 办公室：走 192.168.3.3
         *)          echo "" ;;   # 其它 SSID：撤规则，走直连
     esac
 }
@@ -105,8 +105,8 @@ reconcile() {
     want=$(gw_for "$ssid")
     if [ -n "$want" ]; then
         apply "$want"
-        # 写**完整网关 IP**（不是只写最后一段）—— 面板直接显示它，不用再硬编码网段
-        echo "$ssid $APPLIED" > "$STATE"
+        # 只写最后一段；面板（GW_PREFIX）负责补全成完整 IP
+        echo "$ssid $want" > "$STATE"
         log "OK  网关+DNS -> $APPLIED (ssid=$ssid)"
     else
         clear_rules
