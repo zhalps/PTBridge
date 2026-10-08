@@ -321,3 +321,73 @@ iptables -t nat -C OUTPUT -p udp --dport 53 -j DNAT --to-destination "$APPLIED" 
 
 Android 11 的 `cmd wifi` 不支持配静态 IP；而且静态配置**管不到 IPv6 的 DNS**
 （那条是路由器 RA 通告的），所以无论如何都得靠运行时规则。
+
+## 六、「蓝牙显示连着，但按翻页器没反应」
+
+这是**跟第一节完全不同**的另一种故障：症状很像，但根因在蓝牙栈，不在无障碍。
+
+### 症状
+
+- `Fix Bluetooth` 点下去**看起来是好的**（提示 `Bluetooth on · pager connected`）
+- 但按键**一条都不进来** —— 翻页器像死了一样
+- 隔几分钟（或按几下翻页器）它自己又好了
+
+### 根因：HID 状态的「假在线」
+
+`BluetoothProfile.HID_HOST` 报的 `STATE_CONNECTED`（= 2）**并不代表链路真的活着**。
+底层 BLE 链路僵死时，状态不会立刻更新：
+
+```
+$ dumpsys bluetooth_manager | grep -A2 mInputDevices
+  mInputDevices:
+    AA:BB:CC:DD:EE:FF : 2        ← 照样是 2（CONNECTED），但按键进不来
+```
+
+系统要等到 HCI 层超时才会拆掉 HID：
+
+```
+bta_gattc_conn_cback ... reason=0x0008      # 0x0008 = Connection Timeout
+btif_hh_upstreams_evt: name = ATG-SJL       # 输入设备这一刻才真正建立
+```
+
+所以老版本里这一句是错的 —— 它在这个分支**直接早退，蓝牙侧一个动作都不做**：
+
+```java
+if (st == STATE_CONNECTED) return "Bluetooth on · pager connected";   // ❌
+```
+
+### 现在的处理（v18.2 / v18.3）
+
+状态报 CONNECTED 时**不再早退**：
+
+| 点击情况 | 行为 | 结果文案 |
+|---|---|---|
+| 第 1 次 | 发一次温和重连请求 | `Bluetooth on · pager connected (if it won't page, press a pager key)` |
+| 60 秒内第 2 次、状态仍是 CONNECTED | **强制重建链路**（`svc bluetooth disable/enable`） | `Bluetooth restarted · pager connected`，或 `Bluetooth on · pager offline (press a pager key to wake it)` |
+
+### ⚠️ 三个坑
+
+1. **两次点击的实际间隔要 12~15 秒。**
+   `Fix Bluetooth` 全流程包含无障碍修复的 `sleep 3 + sleep 3`，实测约 **9 秒**；
+   而 `lastFixPressAt` 是走到蓝牙分支（≈点击后第 9 秒）才置位的。
+   间隔 < 9 秒时第 2 次点击会被 `sBusy` **静默丢弃**
+   （日志里连一条记录都没有，很容易误判成"新逻辑没生效"）。
+
+2. **强制重建之后翻页器不会自己回来，要按一下它身上的键。**
+   BLE HID 从机被主机 `disconnect` 之后**不会主动广播**，这是蓝牙规范行为，不是 bug。
+   面板提示文案已如实写成 `(press a pager key to wake it)`。
+
+3. **`/proc/bus/input/devices` 判不了"假在线"。**
+   它只能判"链路真的挂了"（`ATG-SJL` 节点消失）。假在线时旧的 input 节点**还在**
+   （要等 `bta_hh_co_close` 才拆），所以"节点在 = 链路活"不成立。
+
+### 怎么取到这个证据（本机 logd 只有 64 KiB/缓冲区）
+
+```sh
+# ⚠️ 非 root 跑 logcat 只能看到自己进程的日志，必须 su
+su -c "logcat -d -b all -v time > /sdcard/lg.txt"
+# ⚠️ -b all 把多个 buffer 串进同一个文件，行号不连续 → 按时间戳重新排
+sort -k2 /sdcard/lg.txt
+```
+
+高峰期主缓冲区只保留约 **5 分钟**，要取证就得**当场抓**。

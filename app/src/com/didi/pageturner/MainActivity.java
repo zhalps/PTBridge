@@ -80,6 +80,39 @@ import android.widget.TextView;
  *  - 按下色拆成两档、全部取浅灰：大按钮 #EDEDEA→#E0E0DB（Δ13）、
  *    小按钮 #FFFFFF→#EFEFEC（Δ16）。既有可见的变色，又远离"深色"。
  *
+ * v18.2（2026-10-08，用户报「一键清理后点 Fix 不生效，隔一会儿再点才生效」）：
+ *  ⭐ 病根在第 2 个按钮的蓝牙分支，**跟无障碍无关**。见 BtHelper.reconnect() 的注释。
+ *    取证结论（logcat 实证）：
+ *      第 1 次点 Fix → `band added OK`（无障碍这边是好的）
+ *      → 报 `Bluetooth on · pager connected`，**但蓝牙侧一个动作都没做**
+ *      → 此后整整 53 秒里本 App **零条 TOUCH**（按键根本没到达系统）
+ *      → 系统 HCI 层超时才 `reason=0x0008` 拆掉 HID
+ *      → `btif_hh_upstreams_evt: name = ATG-SJL`（输入设备这一刻才真正建立）
+ *      → 第一个按键终于进来 ✅
+ *    原因：`hidState()` 报的 CONNECTED 会「假在线」（底层 BLE 链路僵死、状态没更新），
+ *      而老代码 `if (st == STATE_CONNECTED) return "pager connected";` 直接早退。
+ *    改法（见 BtHelper）：状态报 CONNECTED 时不再早退 ——
+ *      第 1 次点：发一次温和重连 + 如实提示 `(if it won't page, press a pager key)`；
+ *      60 秒内第 2 次点且状态仍是 CONNECTED → 强制 `svc bluetooth disable/enable` 重建链路。
+ *    代价：只在"状态正常却说不能翻页"这种场景下多花 10~15s；平时完全不受影响。
+ *
+ * v18.3（2026-10-08，方案 A 实测通过后收尾）：
+ *  - 逻辑零改动，只补 footer：把「60 秒内再点一次 Fix 可强制重建蓝牙」写进面板，
+ *    否则用户根本不知道有这个操作（footer 由 2 行改 3 行）。
+ *  - 实测证据（logcat 实证）：
+ *      第 1 次点：`secondPress=false` → 温和重连 + 如实提示 ✅
+ *      15 秒后第 2 次点：`secondPress=true`
+ *        → 「二次点按 + 状态仍 CONNECTED -> 强制重建链路」
+ *        → EventHub `Removed device: event4/event5 ATG-SJL`（链路真被拆）
+ *        → `su ok :: svc bluetooth disable` / `su ok :: svc bluetooth enable`
+ *        → `bt_stack: Added device <pager-mac>`
+ *        → 「Bluetooth on · pager offline (press a pager key to wake it)」
+ *    ⚠️ 强制重建后翻页器**不会自动回连**（BLE HID 被断开后不主动广播），
+ *       要按一下翻页器任意键唤醒 —— 提示文案已如实告知，属预期行为，不是 bug。
+ *    ⚠️ 关键时序：Fix 全流程含无障碍修复的 sleep 3 + sleep 3，耗时约 9s；
+ *       `lastFixPressAt` 是走到**蓝牙分支**（≈点击后第 9 秒）才置位的，
+ *       所以两次点击的实际间隔应约 12~15s —— 更短会被 sBusy 直接丢弃。
+ *
  * v16：
  *  - 打开面板时**自动确保「按 SSID 切网关/DNS」的守护进程在跑**，并回读当前生效的网关
  *    显示在左上角（`SSH: ON | Gateway: 3.6`）。守护本身按 SSID 决定用哪个旁路由：
@@ -117,7 +150,7 @@ import android.widget.TextView;
 public class MainActivity extends Activity {
 
     static final String TAG = "PTBridge";
-    static final String VERSION = "v18.1";
+    static final String VERSION = "v18.3";
 
     static final String SVC = "com.didi.pageturner/.PageTurnerService";
     static final String WEREAD = "com.tencent.weread.eink";
@@ -410,7 +443,8 @@ public class MainActivity extends Activity {
         row.addView(bClose, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
 
         TextView foot = new TextView(this);
-        foot.setText("Fix Bluetooth = heal accessibility + reconnect pager. "
+        foot.setText("Fix Bluetooth = heal accessibility + reconnect pager.\n"
+                + "Tap Fix twice within 60s to force a full Bluetooth restart.\n"
                 + "Refresh re-reads status. Top-left shows SSH / gateway.");
         foot.setTextColor(INK3);
         foot.setTextSize(12);
