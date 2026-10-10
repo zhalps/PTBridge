@@ -391,3 +391,74 @@ sort -k2 /sdcard/lg.txt
 ```
 
 高峰期主缓冲区只保留约 **5 分钟**，要取证就得**当场抓**。
+
+---
+
+## 七、面板里按翻页器没反应，切到微信读书却是好的
+
+**症状**：PTBridge 面板里的「Page Turner Test」区，无论怎么按翻页器都不动；
+但一退出面板、回到微信读书，翻页立刻正常。蓝牙显示连着、翻页器本身也是好的。
+
+**根因：同 UID 的全屏焦点窗口会"吃掉"自己 overlay 的触摸。**
+
+PTBridge 有两条接收翻页器触摸的通道：
+
+| 通道 | 窗口类型 | mBaseLayer |
+|---|---|---|
+| `band`（y928~944 的隐形细带） | `TYPE_APPLICATION_OVERLAY` | **121000** |
+| 面板 `MainActivity` | `BASE_APPLICATION` | **21000** |
+
+看起来 band 层号高出 10 万，触摸"应该"落到 band 上 —— **但层号高不等于能接到触摸**。
+当**同一个 UID** 既持有全屏焦点窗口（面板）又挂着 overlay 时，系统给 overlay 派发触摸前
+会先判断"这块区域是不是被同 UID 的焦点窗口覆盖"。面板是全屏**不透明白底**，
+16px 细带完全落在面板内容里 → **触摸被面板自己吃掉，压根到不了 band**。
+
+**实证**（清空 logcat 缓冲后重抓）：
+
+```
+# 面板在前台
+20:54:20.103 I/PTBridge: test mode ON (panel foreground)
+             ↓ 之后只有 su / BT batt / self-heal，一条 TOUCH 都没有
+
+# 面板一销毁，立刻恢复
+20:53:35.096 I/wm_destroy_activity: [.., com.didi.pageturner/.MainActivity, finish-imm:idle]
+20:53:38.618 I/PTBridge: GEST DOWN x0=534.3896 y0=7.0649414
+20:53:38.675 I/PTBridge: ATG tap #1 at x=1404.0 ...  ✅
+```
+
+**修法（v20.1 起）：不要依赖 band 去接面板上的触摸 —— 让面板自己接。**
+
+在 `MainActivity.dispatchTouchEvent()` 里判别"虚拟设备"
+（`dev=[Virtual]` 或 `deviceId < 0`）的事件，直接喂给新增的
+`PageTurnerService.handleTouchFromPanel(ev)`；真人手指照常走正常流程，按钮点击不受影响。
+
+```java
+@Override
+public boolean dispatchTouchEvent(MotionEvent ev) {
+    if (PageTurnerService.sConnected) {
+        PageTurnerService svc = PageTurnerService.sInstance;   // 同进程，直接拿实例
+        if (svc != null && svc.handleTouchFromPanel(ev)) {
+            return true;   // 翻页器的触摸已被消费，不再往下传（否则会误触按钮）
+        }
+    }
+    return super.dispatchTouchEvent(ev);
+}
+```
+
+`band` 保持 16px 原样不动 —— 微信读书里的行为**完全不变**。
+
+### ⚠️ 三个坑
+
+1. **加高 band 解决不了这个问题。**
+   band 的 `top` 恒在 928，加高只会向下延伸、盖住面板里的按钮，
+   而翻页器的触摸也到不了高处 —— 方向完全错了。
+
+2. **`localY` 在两处不一样，但不影响逻辑。**
+   经 band 进来时是相对 band 的局部坐标（`localY=7.06`）；
+   经面板进来时面板是全屏，局部坐标正好等于屏幕坐标（`localY=935.06`）。
+   `onPageTurnerTap()` 只用 `dx`（位移差）和时长，**与坐标原点无关**，两边都对。
+
+3. **翻页器的"长按"发的不是触摸长按，是蓝牙音量键。**
+   实测日志为 `key 25 KEYCODE_VOLUME_DOWN from=ATG-SJL Consumer Control`，
+   走的是 `onKeyEvent()` 那条快路，跟 `handleTouch()` 里的长按分支是两回事。
+   `onKeyEvent()` 返回 `true` 已消费该键，所以**不会改变系统音量**。

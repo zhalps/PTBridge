@@ -28,8 +28,38 @@ public class PageTurnerService extends AccessibilityService {
     static final int BAND_TOP = 928;
     static final int BAND_H = 16;
 
+    /**
+     * v20.1：面板是否在前台（由 MainActivity.onResume/onPause 维护）。
+     *
+     * ★★ 关键发现（2026-10-10 实测坐实）：
+     *   面板在前台时，band **完全接不到**翻页器的触摸。band 是
+     *   `TYPE_APPLICATION_OVERLAY`（mBaseLayer=121000），层号远高于面板
+     *   （`BASE_APPLICATION`，mBaseLayer=21000），**但层号高不等于能接到触摸**：
+     *   当**同一个 UID** 既持有全屏焦点窗口（面板）又挂着 overlay 时，
+     *   系统给 overlay 派发触摸前会先看"这块区域是不是被同 UID 的焦点窗口覆盖"——
+     *   面板是全屏**不透明白底**，16px 细带完全落在面板内容里，触摸被面板自己吃掉。
+     *
+     *   实证（清缓冲后重抓 logcat）：
+     *     20:54:20.103 test mode ON (panel foreground)
+     *     → 之后只有 su / BT batt / self-heal，**一条 TOUCH 都没有**
+     *   面板一销毁立刻恢复：
+     *     20:53:35.096 wm_destroy_activity ... finish-imm:idle
+     *     20:53:38.618 GEST DOWN x0=534.3896 ...   ✅
+     *
+     * 解法（v20.1 起）：**加高 band 没用**（band top 恒在 928，加高只会盖住下面的按钮、
+     *   而且翻页器触摸也到不了高处）。正解是**让面板自己接** ——
+     *   MainActivity 在 `dispatchTouchEvent` 里判别"虚拟设备"触摸，直接喂给
+     *   `PageTurnerService.handleTouchFromPanel()`，真人手指照常走正常流程。
+     *   band 保持 16px 原样不动，微信读书里的行为**完全不变**。
+     */
+    static volatile boolean sPanelMode = false;
+
     // 判定双击的等待窗口：实测间隔 ~140ms，取 220ms 留余量
     static final int DOUBLE_WINDOW_MS = 220;
+
+    // v20：长按阈值。翻页器的短按约 100~200ms，长按会明显超过这个值。
+    // 取 600ms：比任何"手抖的短按"都长，又比"刻意长按"短，实测区分明确。
+    static final int LONG_PRESS_MS = 600;
 
     // 自己注入手势后的静默期：防止注入的事件又被自己的窄带接住，形成回环
     static final int SELF_QUIET_MS = 400;
@@ -51,9 +81,47 @@ public class PageTurnerService extends AccessibilityService {
     static volatile boolean sConnected = false;
     static volatile long sConnectedAt = 0;
 
+    /**
+     * v20.1：服务实例（同进程，MainActivity 与服务的 UID 都是 10115）。
+     * 面板在前台时靠它把 dispatchTouchEvent 收到的翻页器触摸直接喂给 handleTouchFromPanel()。
+     */
+    static volatile PageTurnerService sInstance = null;
+
+    // ---- v20：面板内的「Page Turner Test」支持 ----
+    // 面板上有块测试区，翻页器按键时它自己会变。为了不影响正在读的书，
+    // 面板在前台（onResume）时把 sTestMode 置 true → 本服务只记录、不注入手势。
+    //
+    // 面板要显示的正是这四行（迪迪指定，别的都不要）：
+    //   1. Single click  #N  →  Next page   OK
+    //   2. Double click  #N  →  Prev page   OK
+    //   3. Long press    #N  →  Refresh     OK
+    static volatile boolean sTestMode = false;
+
+    // 四类动作各自累计的次数
+    static volatile int sCntSingle = 0;
+    static volatile int sCntDouble = 0;
+    static volatile int sCntLong = 0;
+
+    // 最近一条动作，供面板即时显示（形如 "Single click #3 -> Next page"）
+    static volatile String sLastAction = "";
+    static volatile long sLastActionAt = 0L;
+    // 每次动作都自增，面板靠它判断"有新事件了"
+    static volatile int sEventSeq = 0;
+
+    // v19 旧字段，保留兼容（面板已不再用，避免其它地方编译报错）
+    static volatile int sTestSingle = 0;
+    static volatile int sTestDouble = 0;
+    static volatile String sHint = "";
+    static volatile long sHintAt = 0L;
+
     int tapCount = 0;
     long lastDispatchMs = 0;
     long lastDismissMs = 0;
+
+    // v20 诊断用：最近一次翻页器手势的特征
+    long gestDownMs = 0;
+    float gestX0 = 0, gestY0 = 0, gestX1 = 0;
+    int gestMoves = 0;
 
     // 微信读书的包名；更新弹窗是 QMUI 原生 Dialog，无障碍能读到文本
     static final String WEREAD_PKG = "com.tencent.weread.eink";
@@ -63,6 +131,7 @@ public class PageTurnerService extends AccessibilityService {
     public void onServiceConnected() {
         sConnected = true;
         sConnectedAt = System.currentTimeMillis();
+        sInstance = this;
         Log.i(TAG, "=== service connected ===");
         handler = new Handler(Looper.getMainLooper());
         try {
@@ -192,6 +261,25 @@ public class PageTurnerService extends AccessibilityService {
         Log.i(TAG, "band rect = x:0 y:" + BAND_TOP + " w:" + w + " h:" + BAND_H);
     }
 
+    /**
+     * v20.1：面板在前台时，由 MainActivity.dispatchTouchEvent() 把翻页器的虚拟触摸喂进来。
+     *
+     * 为什么要走这条路：面板是全屏焦点窗口，band（overlay）接不到同 UID 焦点窗口盖住的区域
+     * （详见 sPanelMode 的注释）。所以面板在前台时干脆**由面板自己接**。
+     * 面板的 dispatchTouchEvent 只把"虚拟设备"的事件转过来，真人手指照常走正常流程。
+     *
+     * @return true = 这条事件是翻页器发的、已被消费（面板不要再用它做别的）
+     */
+    boolean handleTouchFromPanel(MotionEvent ev) {
+        String name = devName(ev);
+        boolean virtual = (name != null && (name.contains("Virtual") || ev.getDeviceId() < 0));
+        if (!virtual) {
+            return false;
+        }
+        handleTouch(ev);
+        return true;
+    }
+
     String devName(MotionEvent ev) {
         InputDevice d = ev.getDevice();
         return d == null ? "<null>" : String.valueOf(d.getName());
@@ -200,6 +288,28 @@ public class PageTurnerService extends AccessibilityService {
     void handleTouch(MotionEvent ev) {
         String name = devName(ev);
         int act = ev.getActionMasked();
+
+        // v20 诊断：翻页器是靠 (起点 x, 时长, 是否两下) 区分动作的，
+        // 所以把 DOWN 起点、MOVE 轨迹、UP 终点/时长全部记下来。
+        boolean virtual = (name != null && (name.contains("Virtual") || ev.getDeviceId() < 0));
+        if (virtual) {
+            if (act == MotionEvent.ACTION_DOWN) {
+                gestDownMs = System.currentTimeMillis();
+                gestX0 = ev.getX();
+                gestY0 = ev.getY();
+                gestX1 = ev.getX();
+                gestMoves = 0;
+                Log.i(TAG, "GEST DOWN x0=" + gestX0 + " y0=" + gestY0);
+            } else if (act == MotionEvent.ACTION_MOVE) {
+                gestX1 = ev.getX();
+                gestMoves++;
+            } else if (act == MotionEvent.ACTION_UP) {
+                long ms = System.currentTimeMillis() - gestDownMs;
+                Log.i(TAG, "GEST UP   x0=" + gestX0 + " x1=" + gestX1
+                        + " moves=" + gestMoves + " durMs=" + ms
+                        + " dx=" + (gestX1 - gestX0));
+            }
+        }
 
         // 诊断：无条件记录每一个触摸，看清到底有没有进来、是谁发的
         Log.i(TAG, "TOUCH act=" + MotionEvent.actionToString(act)
@@ -234,10 +344,42 @@ public class PageTurnerService extends AccessibilityService {
         }
     }
 
+    /**
+     * v20：翻页器手势 → 动作。三类，顺序是「先判长按，再判单击/双击」：
+     *
+     *   · 长按（按住 ≥ LONG_PRESS_MS）  → 刷新屏幕
+     *   · 短按 1 下                     → 下一页
+     *   · 短按 2 下（间隔 ≤ 220ms）     → 上一页
+     *
+     * ⚠️ v20 修掉一个老 bug：老代码每次都 `handler.removeCallbacksAndMessages(null)`，
+     *    于是"连按几下"时，前面几次还没执行的动作会被后面的点击**取消掉** ——
+     *    表现为"按了没反应"。现在长按走独立分支（不挂定时器），
+     *    且只有「确实要走双击判定」时才取消上一次的待执行动作。
+     */
     void onPageTurnerTap(MotionEvent ev) {
+        long durMs = System.currentTimeMillis() - gestDownMs;
+        float dx = Math.abs(gestX1 - gestX0);
+
         tapCount++;
         final int count = tapCount;
-        Log.i(TAG, "ATG tap #" + count + " at x=" + ev.getX() + " y=" + ev.getY());
+        Log.i(TAG, "ATG tap #" + count + " at x=" + ev.getX() + " y=" + ev.getY()
+                + " durMs=" + durMs + " dx=" + dx);
+
+        // ---- ① 长按：按住时间超过阈值 → 刷新（不进单击/双击定时器）----
+        if (durMs >= LONG_PRESS_MS) {
+            tapCount = 0;
+            handler.removeCallbacksAndMessages(null);
+            Log.i(TAG, "=> LONG PRESS : force refresh");
+            if (sTestMode) {
+                sCntLong++;
+                sLastAction = "Long press #" + sCntLong + " -> Refresh";
+                sLastActionAt = System.currentTimeMillis();
+                sEventSeq++;
+            } else {
+                sendBroadcast(new Intent(REFRESH_ACTION));
+            }
+            return;
+        }
 
         handler.removeCallbacksAndMessages(null);
         handler.postDelayed(new Runnable() {
@@ -245,10 +387,26 @@ public class PageTurnerService extends AccessibilityService {
             public void run() {
                 if (count >= 2) {
                     Log.i(TAG, "=> DOUBLE : prev page (swipe right)");
-                    swipe(300, 1100, 1200);
+                    if (sTestMode) {
+                        sCntDouble++;
+                        sLastAction = "Double click #" + sCntDouble + " -> Prev page";
+                        sLastActionAt = System.currentTimeMillis();
+                        sEventSeq++;
+                        sTestDouble++;
+                    } else {
+                        swipe(300, 1100, 1200);
+                    }
                 } else {
                     Log.i(TAG, "=> SINGLE : next page (swipe left)");
-                    swipe(1100, 300, 1200);
+                    if (sTestMode) {
+                        sCntSingle++;
+                        sLastAction = "Single click #" + sCntSingle + " -> Next page";
+                        sLastActionAt = System.currentTimeMillis();
+                        sEventSeq++;
+                        sTestSingle++;
+                    } else {
+                        swipe(1100, 300, 1200);
+                    }
                 }
                 tapCount = 0;
             }
@@ -302,6 +460,17 @@ public class PageTurnerService extends AccessibilityService {
                 && code == KeyEvent.KEYCODE_VOLUME_DOWN
                 && act == KeyEvent.ACTION_UP) {
             Log.i(TAG, "=> VOLUME_DOWN from ATG : FULL REFRESH broadcast");
+            // v20.1：面板的测试区也要能看到「长按」这一行 ——
+            //   实测翻页器的长按发的**不是触摸长按，而是蓝牙音量键**（KEYCODE_VOLUME_DOWN），
+            //   所以它走的是这条 onKeyEvent 快路，跟 handleTouch 里的长按分支是两回事。
+            //   面板里如果只走触摸那条路，第三行永远是 `--`，没法验证。
+            //   这里补一手：测试模式下一并计数（照旧全刷，行为不变）。
+            if (sTestMode) {
+                sCntLong++;
+                sLastAction = "Long press #" + sCntLong + " -> Refresh";
+                sLastActionAt = System.currentTimeMillis();
+                sEventSeq++;
+            }
             Intent i = new Intent(REFRESH_ACTION);
             sendBroadcast(i);
             return true;
@@ -313,6 +482,7 @@ public class PageTurnerService extends AccessibilityService {
     public void onDestroy() {
         super.onDestroy();
         sConnected = false;
+        sInstance = null;
         try {
             if (band != null) {
                 wm.removeView(band);

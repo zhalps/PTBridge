@@ -12,6 +12,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -80,15 +81,15 @@ import android.widget.TextView;
  *  - 按下色拆成两档、全部取浅灰：大按钮 #EDEDEA→#E0E0DB（Δ13）、
  *    小按钮 #FFFFFF→#EFEFEC（Δ16）。既有可见的变色，又远离"深色"。
  *
- * v18.2（2026-10-08，用户报「一键清理后点 Fix 不生效，隔一会儿再点才生效」）：
+ * v18.2（2026-10-08，迪迪报「一键清理后点 Fix 不生效，隔一会儿再点才生效」）：
  *  ⭐ 病根在第 2 个按钮的蓝牙分支，**跟无障碍无关**。见 BtHelper.reconnect() 的注释。
  *    取证结论（logcat 实证）：
- *      第 1 次点 Fix → `band added OK`（无障碍这边是好的）
- *      → 报 `Bluetooth on · pager connected`，**但蓝牙侧一个动作都没做**
- *      → 此后整整 53 秒里本 App **零条 TOUCH**（按键根本没到达系统）
- *      → 系统 HCI 层超时才 `reason=0x0008` 拆掉 HID
- *      → `btif_hh_upstreams_evt: name = ATG-SJL`（输入设备这一刻才真正建立）
- *      → 第一个按键终于进来 ✅
+ *      15:29:19 第 1 次点 Fix → 15:29:25 `band added OK`（无障碍这边是好的）
+ *      → 15:29:28 报 `Bluetooth on · pager connected`，**但蓝牙侧一个动作都没做**
+ *      → 15:29:28~15:30:21 整整 53 秒里 PTBridge **零条 TOUCH**（按键根本没到达系统）
+ *      → 15:30:20 系统 HCI 层超时才 `reason=0x0008` 拆掉 HID
+ *      → 15:30:21.517 `btif_hh_upstreams_evt: name = ATG-SJL`（输入设备这一刻才真正建立）
+ *      → 15:30:21.909 第一个按键终于进来 ✅
  *    原因：`hidState()` 报的 CONNECTED 会「假在线」（底层 BLE 链路僵死、状态没更新），
  *      而老代码 `if (st == STATE_CONNECTED) return "pager connected";` 直接早退。
  *    改法（见 BtHelper）：状态报 CONNECTED 时不再早退 ——
@@ -100,22 +101,52 @@ import android.widget.TextView;
  *  - 逻辑零改动，只补 footer：把「60 秒内再点一次 Fix 可强制重建蓝牙」写进面板，
  *    否则用户根本不知道有这个操作（footer 由 2 行改 3 行）。
  *  - 实测证据（logcat 实证）：
- *      第 1 次点：`secondPress=false` → 温和重连 + 如实提示 ✅
- *      15 秒后第 2 次点：`secondPress=true`
- *        → 「二次点按 + 状态仍 CONNECTED -> 强制重建链路」
- *        → EventHub `Removed device: event4/event5 ATG-SJL`（链路真被拆）
- *        → `su ok :: svc bluetooth disable` / `su ok :: svc bluetooth enable`
- *        → `bt_stack: Added device <pager-mac>`
- *        → 「Bluetooth on · pager offline (press a pager key to wake it)」
+ *      第1次点：15:46:12.785 secondPress=false → 温和重连 + 如实提示 ✅
+ *      15 秒后第2次点：15:46:28.001 secondPress=true
+ *        → 15:46:28.002 「二次点按 + 状态仍 CONNECTED -> 强制重建链路」
+ *        → 15:46:29.033/069 EventHub Removed device event4/event5（链路真被拆）
+ *        → 15:46:29.119 su ok :: svc bluetooth disable
+ *        → 15:46:31.436 su ok :: svc bluetooth enable
+ *        → 15:46:35.136 bt_stack Added device AA:BB:CC:DD:EE:FF
+ *        → 15:46:41.605 「Bluetooth on · pager offline (press a pager key to wake it)」
  *    ⚠️ 强制重建后翻页器**不会自动回连**（BLE HID 被断开后不主动广播），
  *       要按一下翻页器任意键唤醒 —— 提示文案已如实告知，属预期行为，不是 bug。
  *    ⚠️ 关键时序：Fix 全流程含无障碍修复的 sleep 3 + sleep 3，耗时约 9s；
  *       `lastFixPressAt` 是走到**蓝牙分支**（≈点击后第 9 秒）才置位的，
  *       所以两次点击的实际间隔应约 12~15s —— 更短会被 sBusy 直接丢弃。
  *
+ * v19.0（2026-10-10，迪迪提的三件事）：
+ *
+ *  ① **Fix Bluetooth 改成"一次点击即强制重建"**（去掉 60 秒二次点击窗口）
+ *     迪迪原话：「不需要在 60 秒之内第二次点击才强制修复了，第一次点击就直接强制修复吧，
+ *     因为经常断掉，都是需要强制修复的。」
+ *     → `BtHelper.reconnect()` 现在 read 完 hidState 就**直接** `forceRestart()`；
+ *        `lastFixPressAt` / `RETRY_WINDOW_MS` 已删除。
+ *     ⚠️ 代价：每次点 Fix 蓝牙都会短暂断开（约 10~15 秒），只在"真的不能翻页"时才按。
+ *
+ *  ② **三个功能按钮整体上移到 y&lt;860，避开翻页器的触摸带**（这是个大坑）
+ *     翻页器的触摸**恒定落在 y≈935**（1404×1872 屏正中，占屏高 49.7%）。
+ *     v18 的设计是"在 935 那条线上开一条隐形细带接住它"，副作用是：
+ *     面板一打开，翻页器默认那些点就直接把
+ *     【Fix Bluetooth】(y861~977) 和【Stop SSH】(y1137~1253) 按了一串 ——
+ *     用户「想看看有没有修成功」，眼睛还没扫到，按钮已经被按完了。
+ *     → v19 反过来做：**把三个按钮全部移到 860 以上**，让 y935 那条线在面板里
+ *       **没有任何控件**，触摸就落回下面 App 自己的窗口（微信读书里 = 正常翻页）。
+ *       底部小按钮行（y1284~1330）和测试区（y~1100）本来就离得远，保持不动。
+ *       `root.setGravity(CENTER_VERTICAL → TOP)`：否则整块内容在屏高上浮动，位置不可预测。
+ *     ⚠️ 随之删掉 `PageTurnerService.addBand()`：面板与书的布局不同，
+ *       950 那条带在面板里接不到、在书里又多余，**没有它反而两边都对**。
+ *
+ *  ③ **面板内新增「翻页测试区」**：不用切到微信读书就能验证修好没有。
+ *     大字 `123 翻页` + 计数行 `next: N   prev: M   ✅ keys are reaching the system`。
+ *     实现要点：面板在前台时把 `PageTurnerService.sTestMode = true` →
+ *       **服务只记录计数、不注入翻页手势**（否则在面板上按一下会误翻后面那本书）。
+ *     测试区只负责"显示"，**不接收**触摸（否则又占用 935 那条线）。
+ *     计数每 400ms 轮询一次，数字变了才 setText（墨水屏少重绘）。
+ *
  * v16：
  *  - 打开面板时**自动确保「按 SSID 切网关/DNS」的守护进程在跑**，并回读当前生效的网关
- *    显示在左上角（`SSH: ON | Gateway: 3.6`）。守护本身按 SSID 决定用哪个旁路由：
+ *    显示在左上角（`SSH：开 ｜ 网关：3.6`）。守护本身按 SSID 决定用 3.6 还是 3.99：
  *      HomeWiFi -> 192.168.3.2 ；OfficeWiFi -> 192.168.3.3 ；其它 SSID -> 撤规则、走直连
  *    为什么需要：守护由 /data/adb/service.d 的监管拉起，正常情况下不会被清理掉
  *    （oom_score_adj = -1000，和 magiskd 同级）；但万一 service.d 没执行、或将来被
@@ -150,7 +181,7 @@ import android.widget.TextView;
 public class MainActivity extends Activity {
 
     static final String TAG = "PTBridge";
-    static final String VERSION = "v18.3";
+    static final String VERSION = "v20.4";
 
     static final String SVC = "com.didi.pageturner/.PageTurnerService";
     static final String WEREAD = "com.tencent.weread.eink";
@@ -168,10 +199,6 @@ public class MainActivity extends Activity {
     static final String NET_DAEMON = "/data/adb/duo2-net.sh";
     static final String NET_STATE = "/data/adb/duo2-net.state";   // 内容形如 "HomeWiFi 6"
 
-    // 网关显示前缀：state 文件里只存最后一段（如 "6"），这里补全成 "3.6" 显示。
-    // ⚠️ 网段不一样要改这里 —— 例如网段是 192.168.10.x 就写成 "10."
-    static final String GW_PREFIX = "3.";
-
     // 灰度配色：e-ink 上没有色彩抖动，最耐看
     static final int BG = 0xFFFFFFFF;
     static final int INK = 0xFF111111;
@@ -187,6 +214,29 @@ public class MainActivity extends Activity {
     static final int BTN_PRESS_SMALL = 0xFFEFEFEC;
     static final int BTN_LINE = 0xFFC6C6C1;
 
+    // ---- v19：面板「翻页测试区」配色（浅色主题，墨水屏友好）----
+    static final int TEST_FILL = 0xFFF2F2EF;
+    static final int TEST_BORDER = 0xFF9A9A94;
+    static final int TEST_OK = 0xFF1B5E20;      // 收到按键 = 深绿
+    static final int TEST_IDLE = 0xFF9A9A94;    // 还没收到 = 灰
+
+    /**
+     * v19 的关键常量：**所有按钮必须完全落在 y &lt; SAFE_BOTTOM**。
+     *
+     * 为什么：翻页器的触摸**恒定落在 y≈935**（1404×1872 屏的正中，占屏高 49.7%），
+     * 系统认为它属于屏幕**中部的浮窗堆叠区** —— 只有当我们的窗口里有控件
+     * 覆盖住那一片时，触摸才会被我们接住（这正是 v18 那条 y928~944 隐形细带的由来）。
+     * 实测：面板一打开，翻页器默认那些点就直接按在了
+     * 【Fix Bluetooth】(y861~977) 和【Stop SSH】(y1137~1253) 上 ——
+     * 所以用户「想看看有没有修成功」时，眼睛还没扫到，按钮已经被按了一串。
+     *
+     * 解法：把三个功能按钮全部移到 860 以下，让 y935 那一条**没有我们的控件**，
+     * 触摸就落到下面 App 自己的窗口里（在微信读书里就是正常翻页），面板完全不受影响。
+     */
+    static final int SAFE_BOTTOM = 860;
+
+    int shownSeq = -1;      // 上一次渲染的事件序号，变了才 setText（墨水屏少重绘）
+
     final Handler ui = new Handler(Looper.getMainLooper());
 
     TextView statusLine;
@@ -197,6 +247,12 @@ public class MainActivity extends Activity {
     TextView bWeread;
     TextView bSsh;
     TextView bRefresh;
+
+    // v20：Page Turner Test 区的文本
+    LinearLayout testBox;
+    TextView testTitle;
+    TextView[] testLines;          // 每行的第 1 列（动作名），兼容旧引用
+    TextView[][] testCols;         // [行][列] —— 0=动作名 1=次数 2=效果
 
     @Override
     protected void onCreate(Bundle b) {
@@ -215,6 +271,127 @@ public class MainActivity extends Activity {
                 }
             }
         }, 450);
+    }
+
+    /**
+     * v19：面板在前台时打开「测试模式」——服务只记录按键、不注入翻页手势。
+     * 这样在面板上按翻页器不会误翻后面那本书，测试区又能如实反映"按键到没到"。
+     */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        PageTurnerService.sTestMode = true;
+        PageTurnerService.sCntSingle = 0;
+        PageTurnerService.sCntDouble = 0;
+        PageTurnerService.sCntLong = 0;
+        PageTurnerService.sEventSeq = 0;
+        shownSeq = -1;
+        testPolling = true;
+        ui.post(testPoll);
+        Log.i(TAG, "test mode ON (panel foreground)");
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        testPolling = false;
+        ui.removeCallbacks(testPoll);
+        PageTurnerService.sTestMode = false;
+        Log.i(TAG, "test mode OFF (panel left foreground)");
+    }
+
+    /**
+     * v20.1：**面板自己接翻页器的触摸**（这是「面板里按没反应」的最终修法）。
+     *
+     * 根因（2026-10-10 清缓冲后实测坐实）：
+     *   面板是 `BASE_APPLICATION` 的全屏焦点窗口，band 是 `TYPE_APPLICATION_OVERLAY`。
+     *   虽然 band 的 mBaseLayer(121000) 远高于面板(21000)，但**层号高不等于能接到触摸**——
+     *   当**同一个 UID** 既持有全屏焦点窗口又挂着 overlay 时，系统给 overlay 派发触摸前
+     *   会先判断"这块区域是不是被同 UID 的焦点窗口覆盖"，面板是全屏不透明白底 →
+     *   16px 细带完全落在面板内容里 → 触摸被面板自己吃掉。
+     *   实证：`20:54:20.103 test mode ON (panel foreground)` 之后**一条 TOUCH 都没有**；
+     *   面板一销毁（20:53:35 wm_destroy_activity），20:53:38 立刻恢复正常。
+     *
+     * 解法：面板在前台时，由面板自己分发 —— 只把**虚拟设备**（翻页器）的事件转给服务，
+     *   真人手指、按钮点击照常走正常流程，一点不受影响。
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (PageTurnerService.sConnected) {
+            try {
+                PageTurnerService svc = PageTurnerService.sInstance;
+                if (svc != null && svc.handleTouchFromPanel(ev)) {
+                    return true;   // 翻页器的触摸已被消费，不往下传（否则会误触按钮）
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "dispatchTouchEvent: " + t);
+            }
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    volatile boolean testPolling = false;
+
+    /**
+     * v20：Page Turner Test 刷新。每 350ms 看一次事件序号，
+     * 有新事件才重绘（墨水屏上每次无谓重绘都是一次闪）。
+     *
+     * 三行永远是这三行，只把中间的 `--` 换成 `#N`：
+     *   Single click   #2   Next page     ← OK 用颜色表示（深绿 = 通了）
+     */
+    final Runnable testPoll = new Runnable() {
+        @Override
+        public void run() {
+            if (!testPolling) {
+                return;
+            }
+            final int seq = PageTurnerService.sEventSeq;
+            if (seq == shownSeq) {
+                ui.postDelayed(this, 350);
+                return;
+            }
+            shownSeq = seq;
+
+            final int c1 = PageTurnerService.sCntSingle;
+            final int c2 = PageTurnerService.sCntDouble;
+
+            ui.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (testLines == null) {
+                        return;
+                    }
+                    setLine(0, "Single click", c1, "Next page");
+                    setLine(1, "Double click", c2, "Prev page");
+                    einkRefresh();
+                }
+            });
+            ui.postDelayed(this, 350);
+        }
+    };
+
+    /**
+     * 渲染一行：第 1 列动作名不变，第 2 列 `#N`（未触发时 `--`），第 3 列效果名不变。
+     * 次数 > 0 时三列一起转深绿 —— 一眼就能看出"这个动作通了"。
+     */
+    void setLine(int idx, String action, int cnt, String effect) {
+        if (testCols == null || idx >= testCols.length) {
+            return;
+        }
+        TextView[] cols = testCols[idx];
+        if (cols == null || cols.length < 3) {
+            return;
+        }
+        setTextIfChanged(cols[0], action);
+        setTextIfChanged(cols[1], cnt > 0 ? ("#" + cnt) : "--");
+        setTextIfChanged(cols[2], effect);
+
+        int want = cnt > 0 ? TEST_OK : INK3;
+        for (TextView c : cols) {
+            if (c != null && c.getCurrentTextColor() != want) {
+                c.setTextColor(want);
+            }
+        }
     }
 
     @Override
@@ -296,9 +473,11 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
-        root.setGravity(Gravity.CENTER_VERTICAL);
+        // v19：改成 TOP —— 按钮要整体压到 y<860（避开翻页器的 y≈935 触摸带），
+        // CENTER_VERTICAL 会让整块内容在屏高上浮动，位置不可预测。
+        root.setGravity(Gravity.TOP);
         int padH = dp(34);
-        root.setPadding(padH, dp(24), padH, dp(24));
+        root.setPadding(padH, dp(18), padH, dp(24));
 
         // v15：左上角 SSH 状态栏。开=深黑（一眼看到），关=浅灰（不碍眼）
         // v16：同一行右侧再挂一个「网关：3.6 / 3.99 / 直连」
@@ -326,32 +505,36 @@ public class MainActivity extends Activity {
 
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        slp.bottomMargin = dp(16);
+        slp.bottomMargin = dp(10);
         root.addView(tagRow, slp);
+
+        // ---- 标题行：标题 + 版本放在同一行，省出纵向空间给按钮 ----
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.BOTTOM);
 
         TextView title = new TextView(this);
         title.setText("PTBridge");
         title.setTextColor(INK);
-        title.setTextSize(26);
+        title.setTextSize(24);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(title);
+        titleRow.addView(title);
 
         TextView sub = new TextView(this);
-        sub.setText("Bluetooth page turner · key bridge · " + VERSION);
+        sub.setText("   " + VERSION);
         sub.setTextColor(INK3);
         sub.setTextSize(13);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(3);
-        root.addView(sub, lp);
+        titleRow.addView(sub);
+
+        root.addView(titleRow);
 
         statusLine = new TextView(this);
         statusLine.setText("Checking…");
         statusLine.setTextColor(INK2);
         statusLine.setTextSize(16);
-        lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(20);
+        lp.topMargin = dp(10);
         root.addView(statusLine, lp);
 
         resultLine = new TextView(this);
@@ -360,23 +543,24 @@ public class MainActivity extends Activity {
         resultLine.setTextSize(13);
         lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(5);
+        lp.topMargin = dp(4);
         root.addView(resultLine, lp);
 
         View d1 = new View(this);
         d1.setBackgroundColor(LINE);
         lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
-        lp.topMargin = dp(20);
-        lp.bottomMargin = dp(22);
+        lp.topMargin = dp(12);
+        lp.bottomMargin = dp(12);
         root.addView(d1, lp);
 
+        // ===================== v19：三个功能按钮（全部落在 y<860） =====================
         bBt = mkBtn("Fix Bluetooth", true, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 actionBt();
             }
         });
-        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(62));
+        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58));
         root.addView(bBt, lp);
 
         bWeread = mkBtn("Restart WeRead", true, new View.OnClickListener() {
@@ -385,8 +569,8 @@ public class MainActivity extends Activity {
                 actionWeread();
             }
         });
-        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(62));
-        lp.topMargin = dp(12);
+        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58));
+        lp.topMargin = dp(10);
         root.addView(bWeread, lp);
 
         bSsh = mkBtn("Toggle SSH", true, new View.OnClickListener() {
@@ -395,14 +579,78 @@ public class MainActivity extends Activity {
                 toggleSsh();
             }
         });
-        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(62));
-        lp.topMargin = dp(12);
+        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58));
+        lp.topMargin = dp(10);
         root.addView(bSsh, lp);
+
+        // ===================== v20.3：Page Turner Test =====================
+        // 目的：不用切到微信读书，在这个面板上就能看出"修好了没有"。
+        //
+        // v20.3：**只留两行，字号加大**（迪迪：「操作写不下就算了，删掉一行排版居中好看点」+
+        //   「下面显示的字都太小了，看不出效果，稍微放大点」）。
+        //   长按那行删掉 —— 翻页器的长按实际发的是蓝牙音量键（KEYCODE_VOLUME_DOWN），
+        //   走的是 onKeyEvent 那条快路，跟触摸手势是两回事，混在一起反而让人困惑。
+        //   保留的两行正是最常用来验证"通没通"的两个动作：
+        //     Single click  #N  ->  Next page
+        //     Double click  #N  ->  Prev page
+        testBox = new LinearLayout(this);
+        testBox.setOrientation(LinearLayout.VERTICAL);
+        testBox.setBackground(shape2(TEST_FILL, TEST_BORDER, dp(10), dp(2)));
+        testBox.setPadding(dp(20), dp(16), dp(20), dp(16));
+
+        testTitle = new TextView(this);
+        testTitle.setText("Page Turner Test");
+        testTitle.setTextSize(20);
+        testTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        testTitle.setTextColor(INK);
+        testTitle.setGravity(Gravity.CENTER);
+        testBox.addView(testTitle);
+
+        // ===================== v20.4：三列独立 TextView =====================
+        // v20.3 的写法是「一整行字符串 + 等宽字体 + 空格补齐」，实测对齐不好看：
+        //   两行 action 词长不同（Single/Double），补空格后左边起点不齐，
+        //   居中时又把整块往左推。改成**三列各一个 TextView、横向并排、各自居中**，
+        //   第 1 列和第 3 列定宽、第 2 列窄一点放 `#N`，天然对齐，且放大字号也不会错位。
+        testLines = new TextView[2];
+        testCols = new TextView[2][3];
+        String[][] seed = {
+                {"Single click", "--", "Next page"},
+                {"Double click", "--", "Prev page"},
+        };
+        for (int i = 0; i < testLines.length; i++) {
+            LinearLayout line = new LinearLayout(this);
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+
+            for (int c = 0; c < 3; c++) {
+                TextView t = new TextView(this);
+                t.setText(seed[i][c]);
+                t.setTextSize(20);
+                t.setTextColor(INK3);
+                t.setGravity(Gravity.CENTER);
+                // 第 1 列（动作名）固定权重略大、第 2 列（次数）窄、第 3 列（效果）与第 1 列等宽
+                float wt = (c == 1) ? 0.55f : 1.0f;
+                line.addView(t, new LinearLayout.LayoutParams(0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT, wt));
+                testCols[i][c] = t;
+            }
+
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            tlp.topMargin = dp(i == 0 ? 12 : 8);
+            testBox.addView(line, tlp);
+            testLines[i] = testCols[i][0];   // 兼容旧引用
+        }
+
+        lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(14);
+        root.addView(testBox, lp);
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48));
-        lp.topMargin = dp(22);
+        lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46));
+        lp.topMargin = dp(14);
         root.addView(row, lp);
 
         TextView bSet = mkBtn("BT Settings", false, new View.OnClickListener() {
@@ -443,17 +691,27 @@ public class MainActivity extends Activity {
         row.addView(bClose, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
 
         TextView foot = new TextView(this);
-        foot.setText("Fix Bluetooth = heal accessibility + reconnect pager.\n"
-                + "Tap Fix twice within 60s to force a full Bluetooth restart.\n"
-                + "Refresh re-reads status. Top-left shows SSH / gateway.");
+        foot.setText("Fix Bluetooth restarts Bluetooth on the FIRST tap "
+                + "(brief disconnect; press a pager key to wake it afterwards).\n"
+                + "Buttons sit above the middle so the pager can't tap them.");
         foot.setTextColor(INK3);
         foot.setTextSize(12);
         lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(20);
+        lp.topMargin = dp(14);
         root.addView(foot, lp);
 
         setContentView(root);
+    }
+
+    /** v19：带独立描边的圆角背景（测试区用，需要比按钮更明显的框） */
+    GradientDrawable shape2(int fill, int stroke, int radius, int strokeW) {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.RECTANGLE);
+        g.setColor(fill);
+        g.setCornerRadius(radius);
+        g.setStroke(strokeW, stroke);
+        return g;
     }
 
     /** v18b：只在文本真的变化时才 setText —— 墨水屏上每次无谓重绘都是一次闪 */
@@ -555,7 +813,7 @@ public class MainActivity extends Activity {
 
     /**
      * state 文件内容形如 "HomeWiFi 6" / "OfficeWiFi 99" / "某SSID -"。
-     * 取最后一列拼成 GW_PREFIX+N；"-" 表示 SSID 不在名单里、规则已撤（走直连）。
+     * 取最后一列拼成 3.6 / 3.99；"-" 表示 SSID 不在名单里、规则已撤（走直连）。
      */
     static String gwFromState(String out) {
         if (out == null) {
@@ -572,7 +830,7 @@ public class MainActivity extends Activity {
                 return "Direct";
             }
             if (last.matches("\\d+")) {
-                return GW_PREFIX + last;
+                return "3." + last;
             }
         }
         return "-";
@@ -585,7 +843,7 @@ public class MainActivity extends Activity {
                 if (netTag != null) {
                     setTextIfChanged(netTag, "Gateway: " + gw);
                     // 真的走了旁路由才用深黑；直连/未知用浅灰
-                    int want = gw.startsWith(GW_PREFIX) ? INK : INK3;
+                    int want = gw.startsWith("3.") ? INK : INK3;
                     if (netTag.getCurrentTextColor() != want) {
                         netTag.setTextColor(want);
                     }

@@ -37,21 +37,9 @@ public class BtHelper {
 
     static final String PAGER_NAME_PART = "ATG";
 
-    /**
-     * v18.2（2026-10-08 定位）：
-     *   系统 HID profile 报的 STATE_CONNECTED 会「假在线」—— 底层 BLE 链路已经僵死，
-     *   `dumpsys bluetooth_manager` 的 mInputDevices 照样写着 2。
-     *   老版本在这个分支直接 return，等于**点 Fix 时蓝牙侧一个动作都不做**：
-     *   实测那一次整整 53 秒里按键一条都没到达系统（logcat 里零条 TOUCH），
-     *   直到 HCI 层超时（`bta_gattc_conn_cback ... reason=0x0008`）自己重连才恢复。
-     *
-     *   所以现在：状态报 CONNECTED 时不再直接返回 ——
-     *     第 1 次点：发一次温和重连请求 + 如实提示（不能撒谎说"已连好"）；
-     *     60 秒内第 2 次点且状态仍是 CONNECTED：判定"确实还不能用" → 强制重建链路。
-     *   平时状态正常时完全不受影响（不会白白重启蓝牙）。
-     */
-    static volatile long lastFixPressAt = 0L;
-    static final long RETRY_WINDOW_MS = 60_000L;
+    // v19 起不再需要「二次点击窗口」：
+    //   按钮本身就是「我确定现在不能翻页了」的语义，一次点击直接强制重建。
+    //   原来的 lastFixPressAt / RETRY_WINDOW_MS(60s) 已删除。
 
     public static BluetoothAdapter adapter() {
         try {
@@ -146,40 +134,13 @@ public class BtHelper {
 
         int st = hidState(ctx, dev);
 
-        // ---- v18.2：CONNECTED 也可能是"假在线"，不再直接 return ----
-        long now = System.currentTimeMillis();
-        boolean secondPress = (st == STATE_CONNECTED)
-                && lastFixPressAt > 0
-                && (now - lastFixPressAt) < RETRY_WINDOW_MS;
-        lastFixPressAt = now;
-
-        if (st == STATE_CONNECTED) {
-            Log.i(TAG, "BT reconnect: hid=CONNECTED secondPress=" + secondPress);
-            if (secondPress) {
-                // 用户 60 秒内又点了一次 → 他就是在说"还是不能用" → 强制重建链路
-                lastFixPressAt = 0L;
-                Log.i(TAG, "BT reconnect: 二次点按 + 状态仍 CONNECTED -> 强制重建链路");
-                return forceRestart(ctx);
-            }
-            // 第一次：发一次温和重连请求（老版本这条路根本不走），并如实提示 ——
-            // 不能报"已连好"，否则用户会以为修好了。
-            requestHidConnect(ctx, dev);
-            return "Bluetooth on · pager connected (if it won't page, press a pager key)";
-        }
-
-        // ---- 状态不是 CONNECTED：原有链路（这是"一键清理关了蓝牙"那一类） ----
-        lastFixPressAt = 0L;
-
-        // 先做一次"温和"的重连请求（反射调 @hide 的 BluetoothHidHost.connect）。
-        // 实测本机这条路会抛 InvocationTargetException（多半缺 BLUETOOTH_PRIVILEGED），
-        // 但留着无害，且换固件/机型可能就通了。
-        requestHidConnect(ctx, dev);
-
-        if (hidConnected(ctx, dev, 2500)) {
-            return "Bluetooth on · pager reconnected";
-        }
-
-        Log.i(TAG, "BT reconnect: 温和重连无效 -> 重启蓝牙总开关");
+        // ---- v19：一次点击就强制重建 ----
+        // v18.2 曾用"60 秒内点第二次才强制重建"来避免误伤，
+        // 但迪迪的实际使用反馈是「经常断掉，都是需要强制修复的」——
+        // 那个窗口只带来困惑（"为什么点了没用"），没有带来保护。
+        // 现在：只要按钮被按下，就直接走强制重建（关总开关 → 开 → 等翻页器回来）。
+        // 代价是每次点 Fix 蓝牙都会短暂断开，所以只在"真的不能翻页"时才按。
+        Log.i(TAG, "BT reconnect: hid=" + st + " -> 强制重建链路（v19 单次点击即强制）");
         return forceRestart(ctx);
     }
 
