@@ -181,7 +181,7 @@ import android.widget.TextView;
 public class MainActivity extends Activity {
 
     static final String TAG = "PTBridge";
-    static final String VERSION = "v20.4";
+    static final String VERSION = "v20.5";
 
     static final String SVC = "com.didi.pageturner/.PageTurnerService";
     static final String WEREAD = "com.tencent.weread.eink";

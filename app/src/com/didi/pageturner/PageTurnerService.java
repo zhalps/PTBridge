@@ -262,23 +262,56 @@ public class PageTurnerService extends AccessibilityService {
     }
 
     /**
-     * v20.1：面板在前台时，由 MainActivity.dispatchTouchEvent() 把翻页器的虚拟触摸喂进来。
+     * v20.5：面板在前台时，由 MainActivity.dispatchTouchEvent() 把触摸喂进来，判断
+     * **这一下是不是翻页器发的**。
      *
-     * 为什么要走这条路：面板是全屏焦点窗口，band（overlay）接不到同 UID 焦点窗口盖住的区域
-     * （详见 sPanelMode 的注释）。所以面板在前台时干脆**由面板自己接**。
-     * 面板的 dispatchTouchEvent 只把"虚拟设备"的事件转过来，真人手指照常走正常流程。
+     * ⚠️⚠️ v20.1 的严重错误（迪迪实测报的：面板里所有按钮都点不动、点哪都计数）：
+     *   当时的判据是 `name.contains("Virtual") || deviceId < 0` —— **完全错**。
+     *   真相是：**这台设备的触摸屏本身就上报为 `dev=[Virtual]`、`deviceId=-1`**，
+     *   所有触摸（包括手指）都走虚拟设备通道。于是我的判别把**手指也当成翻页器**，
+     *   在 dispatchTouchEvent 里 return true 全吃掉 → 按钮全废、点哪都 +1。
+     *   而"翻页器上报为 Virtual"这个当初的结论，是被 band 里的局部坐标（localY=7.06）
+     *   误导得出的，**从来没有独立验证过**。
      *
-     * @return true = 这条事件是翻页器发的、已被消费（面板不要再用它做别的）
+     * ⭐ 真正唯一的可靠判据是**落点 Y**：
+     *   翻页器的触摸恒定落在 y≈935 那一条带上（这正是 band 存在的理由），
+     *   而手指点到哪就是哪。所以只接受 Y 落在 [PANEL_BAND_LO, PANEL_BAND_HI] 内的事件。
+     *
+     *   ⚠️ 而这个判定带**必须落在"面板里没有可点击控件"的那一段**，否则手指点按钮
+     *   会被误判成翻页器。v20.4 面板实测布局：
+     *     Fix 364~472 / WeRead 490~598 / StopSSH 616~724 /
+     *     测试区 750~986 / 小按钮行 1012~1098 / footer 1124~1181
+     *   → **920~1008 是安全的**（测试区底 986 之后、小按钮行 1012 之前）。取 920~1004 留余量。
+     *
+     * @return true = 这条事件判定为翻页器发、已被消费（面板不要再往下传）
      */
+    static final int PANEL_BAND_LO = BAND_TOP - 8;    // 920
+    static final int PANEL_BAND_HI = BAND_TOP + 76;   // 1004
+
     boolean handleTouchFromPanel(MotionEvent ev) {
-        String name = devName(ev);
-        boolean virtual = (name != null && (name.contains("Virtual") || ev.getDeviceId() < 0));
-        if (!virtual) {
+        int act = ev.getActionMasked();
+
+        // DOWN 时先看落点 Y：不在翻页器触摸带内 → 一律当手指，放行
+        if (act == MotionEvent.ACTION_DOWN) {
+            float y = ev.getY();
+            panelDownInBand = (y >= PANEL_BAND_LO && y <= PANEL_BAND_HI);
+            if (!panelDownInBand) {
+                Log.i(TAG, "panel touch: finger (y=" + y + ") -> pass through");
+                return false;
+            }
+            Log.i(TAG, "panel touch: in band (y=" + y + ") -> track as pager");
+        }
+
+        if (!panelDownInBand) {
             return false;
         }
+
         handleTouch(ev);
         return true;
     }
+
+    /** 面板上前一次 DOWN 是否落在翻页器触摸带内 */
+    boolean panelDownInBand = false;
 
     String devName(MotionEvent ev) {
         InputDevice d = ev.getDevice();
@@ -291,24 +324,23 @@ public class PageTurnerService extends AccessibilityService {
 
         // v20 诊断：翻页器是靠 (起点 x, 时长, 是否两下) 区分动作的，
         // 所以把 DOWN 起点、MOVE 轨迹、UP 终点/时长全部记下来。
-        boolean virtual = (name != null && (name.contains("Virtual") || ev.getDeviceId() < 0));
-        if (virtual) {
-            if (act == MotionEvent.ACTION_DOWN) {
-                gestDownMs = System.currentTimeMillis();
-                gestX0 = ev.getX();
-                gestY0 = ev.getY();
-                gestX1 = ev.getX();
-                gestMoves = 0;
-                Log.i(TAG, "GEST DOWN x0=" + gestX0 + " y0=" + gestY0);
-            } else if (act == MotionEvent.ACTION_MOVE) {
-                gestX1 = ev.getX();
-                gestMoves++;
-            } else if (act == MotionEvent.ACTION_UP) {
-                long ms = System.currentTimeMillis() - gestDownMs;
-                Log.i(TAG, "GEST UP   x0=" + gestX0 + " x1=" + gestX1
-                        + " moves=" + gestMoves + " durMs=" + ms
-                        + " dx=" + (gestX1 - gestX0));
-            }
+        // v20.5：不再用"设备名 Virtual"判虚拟设备（那是错的，触摸屏自己就叫 Virtual），
+        //        改由来源决定 —— band 收到的都是翻页器；面板喂进来的已由 handleTouchFromPanel 筛过。
+        if (act == MotionEvent.ACTION_DOWN) {
+            gestDownMs = System.currentTimeMillis();
+            gestX0 = ev.getX();
+            gestY0 = ev.getY();
+            gestX1 = ev.getX();
+            gestMoves = 0;
+            Log.i(TAG, "GEST DOWN x0=" + gestX0 + " y0=" + gestY0);
+        } else if (act == MotionEvent.ACTION_MOVE) {
+            gestX1 = ev.getX();
+            gestMoves++;
+        } else if (act == MotionEvent.ACTION_UP) {
+            long ms = System.currentTimeMillis() - gestDownMs;
+            Log.i(TAG, "GEST UP   x0=" + gestX0 + " x1=" + gestX1
+                    + " moves=" + gestMoves + " durMs=" + ms
+                    + " dx=" + (gestX1 - gestX0));
         }
 
         // 诊断：无条件记录每一个触摸，看清到底有没有进来、是谁发的
@@ -328,20 +360,11 @@ public class PageTurnerService extends AccessibilityService {
             return;
         }
 
-        // ★ 关键：翻页器的触摸上报设备名是 "Virtual"、deviceId=-1，不是 "ATG-SJL"
-        //   （它的两个节点 descriptor 相同，被系统合并后走虚拟输入设备通道）
-        //   真触摸屏是 "goodix_ts"，设备 id 正常
-        boolean isPageTurner = (name != null && name.length() > 0
-                && (name.contains("Virtual") || ev.getDeviceId() < 0));
-
-        if (isPageTurner) {
-            onPageTurnerTap(ev);
-        } else if (name != null && name.contains("goodix")) {
-            // 真人手指正好点到这条隐形细线上，原样回放一次，尽量不打扰阅读
-            replayTap(ev.getX(), ev.getY(), name);
-        } else {
-            Log.i(TAG, "ignore unknown dev: " + name);
-        }
+        // v20.5：能走到这里的触摸，要么来自 band（那条带只有翻页器会去），
+        //        要么已被 handleTouchFromPanel 的 Y 判定筛过 → 直接当翻页器处理。
+        //        （旧代码用 name.contains("Virtual") 判，而触摸屏本身就叫 Virtual，
+        //          会导致真手指也被当翻页器 —— 已删除该判据。）
+        onPageTurnerTap(ev);
     }
 
     /**

@@ -462,3 +462,37 @@ public boolean dispatchTouchEvent(MotionEvent ev) {
    实测日志为 `key 25 KEYCODE_VOLUME_DOWN from=ATG-SJL Consumer Control`，
    走的是 `onKeyEvent()` 那条快路，跟 `handleTouch()` 里的长按分支是两回事。
    `onKeyEvent()` 返回 `true` 已消费该键，所以**不会改变系统音量**。
+
+### ⚠️⚠️ 追加：v20.1 曾用一个**完全错误**的判据，导致面板全 UI 失效
+
+v20.1 第一版用设备名判翻页器：
+
+```java
+boolean virtual = name.contains("Virtual") || ev.getDeviceId() < 0;   // ← 错
+```
+
+**这台设备的触摸屏本身就上报为 `dev=[Virtual]`、`deviceId=-1`** ——
+所有触摸（含手指）都走虚拟设备通道。于是手指也被当翻页器，
+在最外层 `dispatchTouchEvent` 被 `return true` 全吃掉 →
+**所有按钮都点不动、点哪都算一次翻页计数**。
+
+```
+# 迪迪点 Fix 按钮（y402），却报：
+TOUCH ... rawY=402.78 devId=-1 dev=[Virtual]
+ATG tap #1 ...  => SINGLE : next page (swipe left)     ← 被吃掉了
+```
+
+**正确判据是落点 Y**（翻页器触摸恒定在 y≈935，手指点到哪是哪）：
+
+```java
+static final int PANEL_BAND_LO = BAND_TOP - 8;    // 920
+static final int PANEL_BAND_HI = BAND_TOP + 76;   // 1004
+// DOWN 时只看 Y，不在带内 → 放行（当手指处理）
+```
+
+⚠️ **这条判定带必须落在"面板里没有可点击控件"的那一段**。实测面板布局：
+Fix 364~472 / WeRead 490~598 / StopSSH 616~724 / 测试区 750~986 /
+小按钮行 1026~1112 → **920~1004 安全**。**改布局后必须重新核对这条带。**
+
+> 教训：`dev=[Virtual]` / `deviceId<0` 在本机是**触摸屏**的特征，不是翻页器的特征。
+> 在 `dispatchTouchEvent` 最外层拦截风险极高 —— 判错一次 = 整个 UI 失效。
